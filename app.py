@@ -67,7 +67,7 @@ def setup_pipelines(_paper_id):
     repo_id = "Qwen/Qwen1.5-7B-Chat"
     llm = HuggingFaceHub(
         repo_id=repo_id,
-        model_kwargs={"temperature": 0.3, "max_length": 2048},
+        model_kwargs={"temperature": 0.3, "max_length": 2048}
     )
     print("--- 成功连接到HuggingFace Hub模型 ---")
 
@@ -214,3 +214,4 @@ elif st.session_state.stage == 'chat':
         st.session_state.pop('downloaded_pdf_path', None)
 
         st.rerun()
+
