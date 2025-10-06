@@ -2,9 +2,13 @@ import streamlit as st
 import os
 import arxiv
 from dotenv import load_dotenv
+import requests
 
-# --- 核心修改 1: 导入智谱AI的模型 ---
-from langchain_glm import ChatZhipuAI
+# --- 尝试导入智谱AI模型；若不可用，将在运行时自动回退到 Hugging Face 免费模型 ---
+try:
+    from langchain_glm import ChatZhipuAI  # type: ignore
+except Exception:
+    ChatZhipuAI = None  # 延迟回退
 
 # --- LangChain 核心组件 ---
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -14,10 +18,97 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
+from langchain_core.language_models.llms import LLM
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from typing import List, Optional, Any
 
 
 # 加载环境变量 (在Streamlit Cloud上会自动读取Secrets)
 load_dotenv()
+
+# --- 0. 最小HF Inference API封装：作为智谱不可用时的自动回退 ---
+class HfInferenceLLM(LLM):
+    repo_id: str
+    temperature: float = 0.3
+    max_new_tokens: int = 2048
+    timeout: float = 60.0
+    fallback_models: Optional[List[str]] = None
+
+    @property
+    def _llm_type(self) -> str:
+        return "hf-inference-api"
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        if not token:
+            raise RuntimeError("缺少 HUGGINGFACEHUB_API_TOKEN，请在Secrets中配置。")
+
+        url = f"https://api-inference.huggingface.co/models/{self.repo_id}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "temperature": self.temperature,
+                "max_new_tokens": self.max_new_tokens,
+                "return_full_text": False,
+            },
+            "options": {"wait_for_model": True},
+        }
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+        if resp.status_code == 404:
+            fallback_env = os.getenv("HF_FALLBACK_MODELS")
+            fallbacks = (
+                [m.strip() for m in fallback_env.split(",") if m.strip()]
+                if fallback_env
+                else (self.fallback_models or [
+                    "google/flan-t5-base",
+                    "google/flan-t5-small",
+                    "google/flan-t5-large",
+                ])
+            )
+            for fb in fallbacks:
+                fb_url = f"https://api-inference.huggingface.co/models/{fb}"
+                fb_resp = requests.post(fb_url, headers=headers, json=payload, timeout=self.timeout)
+                if fb_resp.ok:
+                    self.repo_id = fb
+                    try:
+                        data = fb_resp.json()
+                    except Exception:
+                        return fb_resp.text
+                    if isinstance(data, list) and data and isinstance(data[0], dict):
+                        text = data[0].get("generated_text")
+                        if text is not None:
+                            return text
+                    if isinstance(data, dict) and "generated_text" in data:
+                        return str(data["generated_text"])  # type: ignore
+                    return str(data)
+            raise RuntimeError("HF Inference API 404：选定与回退模型均不可用。")
+
+        if resp.status_code == 429:
+            raise RuntimeError("HF Inference API 429：频率限制，请稍后再试。")
+
+        resp.raise_for_status()
+        try:
+            data = resp.json()
+        except Exception:
+            return resp.text
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            text = data[0].get("generated_text")
+            if text is not None:
+                return text
+        if isinstance(data, dict):
+            if "generated_text" in data:
+                return str(data["generated_text"])  # type: ignore
+            if "error" in data:
+                raise RuntimeError(f"HF Inference API error: {data['error']}")
+        return str(data)
 
 # --- 1. 页面配置 ---
 st.set_page_config(page_title="AI论文搜索与问答机器人", page_icon=" C", layout="wide")
@@ -125,18 +216,34 @@ elif st.session_state.stage == 'chat':
     try:
         retriever, paper_metadata, downloaded_pdf_path = get_retriever_and_metadata(paper_id)
 
-        # --- 核心修改 2: 初始化智谱AI的LLM ---
-        # 确保您已在Streamlit Secrets中设置了 ZHIPUAI_API_KEY
+        # --- 优先使用智谱AI；若包或密钥不可用则自动回退至HF免费模型 ---
+        llm = None
         zhipuai_api_key = os.getenv("ZHIPUAI_API_KEY")
-        if not zhipuai_api_key:
-            st.error("错误: 请在Streamlit Secrets中设置 ZHIPUAI_API_KEY。")
-            st.stop()
-        
-        llm = ChatZhipuAI(
-            model="glm-4",
-            temperature=0.3,
-            api_key=zhipuai_api_key
-        )
+        zhipu_model = os.getenv("ZHIPU_MODEL", "glm-4-flash")
+        if ChatZhipuAI is not None and zhipuai_api_key:
+            try:
+                llm = ChatZhipuAI(
+                    model=zhipu_model,
+                    temperature=0.3,
+                    api_key=zhipuai_api_key
+                )
+                current_model_label = f"ZhipuAI {zhipu_model}"
+            except Exception as _:
+                llm = None
+        if llm is None:
+            # 回退：使用HF免费模型
+            selected_model = os.getenv("HF_MODEL_ID", "google/flan-t5-base")
+            llm = HfInferenceLLM(
+                repo_id=selected_model,
+                temperature=0.3,
+                max_new_tokens=512,
+                fallback_models=[
+                    "google/flan-t5-base",
+                    "google/flan-t5-small",
+                    "google/flan-t5-large",
+                ]
+            )
+            current_model_label = f"HF {selected_model}"
 
         # 创建对话检索链 (后续逻辑不变)
         rag_chain = ConversationalRetrievalChain.from_llm(
@@ -164,8 +271,8 @@ elif st.session_state.stage == 'chat':
         # --- 聊天界面 ---
         st.header(f"3. 正在与论文对话: {paper_metadata.title}")
 
-        # --- 核心修改 3: 更新UI上显示的当前模型名称 ---
-        st.caption("当前模型: ZhipuAI GLM-4")
+        # 显示当前实际使用的模型
+        st.caption(f"当前模型: {current_model_label}")
         
         with open(downloaded_pdf_path, "rb") as pdf_file:
             st.download_button(
