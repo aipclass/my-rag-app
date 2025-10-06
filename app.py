@@ -1,7 +1,8 @@
 import streamlit as st
 import os
 import arxiv
-from langchain_community.llms import HuggingFaceHub
+# [最终修复 1]: 导入官方推荐的 HuggingFaceEndpoint 替代 HuggingFaceHub
+from langchain_huggingface import HuggingFaceEndpoint
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -25,8 +26,6 @@ if not os.path.exists(PDF_SAVE_PATH):
     os.makedirs(PDF_SAVE_PATH)
 
 # --- 3. Cached Data Processing Function ---
-# This function handles the heavy lifting (downloading, embedding, etc.)
-# and is cached to avoid re-running on every interaction.
 @st.cache_resource
 def get_retriever_and_metadata(_paper_id):
     print(f"--- [Cache Miss] Building retriever for paper {_paper_id} ---")
@@ -57,7 +56,6 @@ if 'stage' not in st.session_state:
     st.session_state.stage = 'search'
 if 'messages' not in st.session_state:
     st.session_state.messages = []
-# [FIX #1]: Initialize conversation memory in session state
 if 'memory' not in st.session_state:
     st.session_state.memory = ConversationBufferMemory(
         memory_key="chat_history", return_messages=True, output_key='answer'
@@ -67,7 +65,6 @@ if 'memory' not in st.session_state:
 
 if st.session_state.stage == 'search':
     st.header("1. 搜索论文")
-    # ... (Search stage code remains the same)
     query = st.text_input("输入您想搜索的论文关键词", key="search_query")
     if st.button(" C 搜索"):
         if query:
@@ -84,10 +81,8 @@ if st.session_state.stage == 'search':
         else:
             st.warning("请输入搜索关键词。")
 
-
 elif st.session_state.stage == 'select':
     st.header("2. 选择一篇论文进行对话")
-    # ... (Select stage code remains the same)
     if 'search_results' in st.session_state and st.session_state.search_results:
         for paper in st.session_state.search_results:
             st.subheader(paper.title)
@@ -97,7 +92,6 @@ elif st.session_state.stage == 'select':
             if st.button(f" C 与这篇论文对话", key=f"select_{paper_id}"):
                 st.session_state.selected_paper_id = paper_id
                 st.session_state.stage = 'chat'
-                # Clear previous chat history when starting a new conversation
                 st.session_state.messages = []
                 st.session_state.memory.clear()
                 st.rerun()
@@ -106,26 +100,25 @@ elif st.session_state.stage == 'select':
         st.session_state.stage = 'search'
         st.rerun()
 
-
 elif st.session_state.stage == 'chat':
     paper_id = st.session_state.selected_paper_id
 
     try:
-        # 1. Get cached data processor (retriever) and metadata
         retriever, paper_metadata, downloaded_pdf_path = get_retriever_and_metadata(paper_id)
 
-        # 2. Create the LLM object (this is fast)
-        llm = HuggingFaceHub(
+        # [最终修复 2]: 使用 HuggingFaceEndpoint 替代 HuggingFaceHub
+        # 它更现代，且能正确处理新版 huggingface_hub 库
+        llm = HuggingFaceEndpoint(
             repo_id="Qwen/Qwen1.5-7B-Chat",
-            model_kwargs={"temperature": 0.3, "max_length": 2048}
+            temperature=0.3,
+            max_new_tokens=2048,
+            # 它会自动从环境变量(Secrets)中读取HUGGINGFACEHUB_API_TOKEN
         )
         
-        # 3. Create the RAG chain, passing the PERSISTENT memory from session state
-        # [FIX #2]: Use the memory object from st.session_state
         rag_chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
             retriever=retriever,
-            memory=st.session_state.memory, # Use the memory from session state
+            memory=st.session_state.memory,
             combine_docs_chain_kwargs={
                 "prompt": PromptTemplate(
                     template="""[任务指令]
@@ -144,9 +137,7 @@ elif st.session_state.stage == 'chat':
             return_source_documents=True
         )
 
-        # 4. Display the chat interface
         st.header(f"3. 正在与论文对话: {paper_metadata.title}")
-        # ... (Display code remains the same)
         with open(downloaded_pdf_path, "rb") as pdf_file:
             st.download_button(
                 label="📥 下载当前论文PDF",
@@ -156,28 +147,22 @@ elif st.session_state.stage == 'chat':
             )
         st.divider()
 
-        # Display previous messages
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        # Handle new user input
         user_question = st.chat_input("请就这篇论文提问：")
         if user_question:
-            # Add user message to display list
             st.session_state.messages.append({"role": "user", "content": user_question})
             with st.chat_message("user"):
                 st.markdown(user_question)
 
             with st.spinner("模型正在检索与思考中..."):
-                # [FIX #3]: Call the chain simply. The memory object handles the history automatically.
                 result = rag_chain.invoke({"question": user_question})
                 ai_response = result['answer']
                 
-                # Add AI response to display list
                 st.session_state.messages.append({"role": "assistant", "content": ai_response})
                 
-                # Display AI response
                 with st.chat_message("assistant"):
                     st.markdown(ai_response)
                     with st.expander("查看本次回答引用的原文片段"):
@@ -187,13 +172,12 @@ elif st.session_state.stage == 'chat':
         if st.button(" C 返回论文选择列表"):
             st.session_state.stage = 'select'
             st.session_state.messages = []
-            st.session_state.memory.clear() # Clear memory for the next conversation
+            st.session_state.memory.clear()
             st.session_state.pop('selected_paper_id', None)
             st.rerun()
 
     except Exception as e:
         st.error(f"处理对话时发生错误: {e}")
         if st.button("返回重试"):
-            # Clear potentially problematic cached resources before retrying
             get_retriever_and_metadata.clear()
             st.rerun()
