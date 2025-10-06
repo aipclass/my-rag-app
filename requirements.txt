@@ -11,3 +11,4 @@ PyMuPDF
 faiss-cpu
 sentence-transformers
 python-dotenv
+requests
