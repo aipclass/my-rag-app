@@ -65,6 +65,11 @@ class HfInferenceLLM(LLM):
 
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    f"HF Inference API 404: 模型未找到或未启用推理API -> {self.repo_id}. "
+                    "请确认模型ID正确，或在Secrets中设置 HF_MODEL_ID 指向可用模型。"
+                )
             resp.raise_for_status()
         except Exception as e:
             raise RuntimeError(f"HF Inference API request failed: {e}")
@@ -183,8 +188,10 @@ elif st.session_state.stage == 'chat':
         retriever, paper_metadata, downloaded_pdf_path = get_retriever_and_metadata(paper_id)
 
         # 使用自定义的 HF Inference API 包装器以规避 InferenceClient.post 兼容性问题
+        # 允许通过环境变量 HF_MODEL_ID 覆盖默认模型；默认选择更易于在免费Inference API上可用的较小模型
+        selected_model = os.getenv("HF_MODEL_ID", "Qwen/Qwen2-1.5B-Instruct")
         llm = HfInferenceLLM(
-            repo_id="Qwen/Qwen1.5-7B-Chat",
+            repo_id=selected_model,
             temperature=0.3,
             max_new_tokens=2048,
         )
@@ -212,6 +219,7 @@ elif st.session_state.stage == 'chat':
         )
 
         st.header(f"3. 正在与论文对话: {paper_metadata.title}")
+        st.caption(f"当前模型: {selected_model}")
         with open(downloaded_pdf_path, "rb") as pdf_file:
             st.download_button(
                 label="📥 下载当前论文PDF",
