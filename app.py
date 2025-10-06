@@ -189,7 +189,7 @@ elif st.session_state.stage == 'chat':
 
         # 使用自定义的 HF Inference API 包装器以规避 InferenceClient.post 兼容性问题
         # 允许通过环境变量 HF_MODEL_ID 覆盖默认模型；默认选择更易于在免费Inference API上可用的较小模型
-        selected_model = os.getenv("HF_MODEL_ID", "Qwen/Qwen1.5-7B-Chat")
+        selected_model = os.getenv("HF_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
         llm = HfInferenceLLM(
             repo_id=selected_model,
             temperature=0.3,
@@ -264,4 +264,5 @@ elif st.session_state.stage == 'chat':
         if st.button("返回重试"):
             get_retriever_and_metadata.clear()
             st.rerun()
+
 
