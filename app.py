@@ -30,6 +30,7 @@ class HfInferenceLLM(LLM):
     temperature: float = 0.3
     max_new_tokens: int = 2048
     timeout: float = 60.0
+    fallback_models: Optional[List[str]] = None
 
     @property
     def _llm_type(self) -> str:
@@ -66,10 +67,40 @@ class HfInferenceLLM(LLM):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             if resp.status_code == 404:
-                raise RuntimeError(
-                    f"HF Inference API 404: 模型未找到或未启用推理API -> {self.repo_id}. "
-                    "请确认模型ID正确，或在Secrets中设置 HF_MODEL_ID 指向可用模型。"
+                # 自动回退到常用可用模型（可通过环境变量 HF_FALLBACK_MODELS 覆盖）
+                fallback_env = os.getenv("HF_FALLBACK_MODELS")
+                fallbacks = (
+                    [m.strip() for m in fallback_env.split(",") if m.strip()]
+                    if fallback_env
+                    else (self.fallback_models
+                          or [
+                              "google/flan-t5-base",
+                              "google/flan-t5-small",
+                              "google/flan-t5-large",
+                          ])
                 )
+                for fb in fallbacks:
+                    fb_url = f"https://api-inference.huggingface.co/models/{fb}"
+                    fb_resp = requests.post(fb_url, headers=headers, json=payload, timeout=self.timeout)
+                    if fb_resp.ok:
+                        # 切换当前模型为成功的回退模型
+                        self.repo_id = fb
+                        try:
+                            data = fb_resp.json()
+                            if isinstance(data, list) and data and isinstance(data[0], dict):
+                                text = data[0].get("generated_text")
+                                if text is not None:
+                                    return text
+                            if isinstance(data, dict) and "generated_text" in data:
+                                return str(data["generated_text"])  # type: ignore
+                            return str(data)
+                        except Exception:
+                            return fb_resp.text
+                raise RuntimeError(
+                    "HF Inference API 404: 选定模型不可用，且所有回退模型均失败。"
+                )
+            if resp.status_code == 429:
+                raise RuntimeError("HF Inference API 429: 触发频率限制，请稍后重试。")
             resp.raise_for_status()
         except Exception as e:
             raise RuntimeError(f"HF Inference API request failed: {e}")
@@ -189,11 +220,16 @@ elif st.session_state.stage == 'chat':
 
         # 使用自定义的 HF Inference API 包装器以规避 InferenceClient.post 兼容性问题
         # 允许通过环境变量 HF_MODEL_ID 覆盖默认模型；默认选择更易于在免费Inference API上可用的较小模型
-        selected_model = os.getenv("HF_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
+        selected_model = os.getenv("HF_MODEL_ID", "google/flan-t5-base")
         llm = HfInferenceLLM(
             repo_id=selected_model,
             temperature=0.3,
             max_new_tokens=2048,
+            fallback_models=[
+                "google/flan-t5-base",
+                "google/flan-t5-small",
+                "google/flan-t5-large",
+            ]
         )
 
         rag_chain = ConversationalRetrievalChain.from_llm(
@@ -264,5 +300,3 @@ elif st.session_state.stage == 'chat':
         if st.button("返回重试"):
             get_retriever_and_metadata.clear()
             st.rerun()
-
-
