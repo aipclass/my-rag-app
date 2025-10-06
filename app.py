@@ -11,22 +11,25 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
 
+# Load environment variables. On Streamlit Cloud, this reads from Secrets.
 load_dotenv()
 
+# --- 1. Page Configuration ---
 st.set_page_config(page_title="AI论文搜索与问答机器人", page_icon=" C", layout="wide")
 st.title(" C AI论文搜索与问答机器人")
 st.write("在这里，您可以搜索arXiv上的论文，并与选定的论文进行智能对话。")
 
+# --- 2. Directory Path Definition ---
 PDF_SAVE_PATH = "downloaded_papers"
 if not os.path.exists(PDF_SAVE_PATH):
     os.makedirs(PDF_SAVE_PATH)
 
-# [结构性修复 1]: 创建一个只负责数据处理和向量化的缓存函数
-# 这个函数返回的对象（retriever, paper, path）都是可以被安全缓存的
+# --- 3. Cached Data Processing Function ---
+# This function handles the heavy lifting (downloading, embedding, etc.)
+# and is cached to avoid re-running on every interaction.
 @st.cache_resource
 def get_retriever_and_metadata(_paper_id):
     print(f"--- [Cache Miss] Building retriever for paper {_paper_id} ---")
-
     client = arxiv.Client()
     search = arxiv.Search(id_list=[_paper_id])
     paper = next(client.results(search))
@@ -49,17 +52,22 @@ def get_retriever_and_metadata(_paper_id):
 
     return retriever, paper, local_pdf_path
 
-# --- Session State and App Flow ---
+# --- Session State Initialization ---
 if 'stage' not in st.session_state:
     st.session_state.stage = 'search'
 if 'messages' not in st.session_state:
     st.session_state.messages = []
-# [结构性修复 2]: 我们不再在session_state中缓存整个chain，只在需要时构建
-# if 'rag_chain' not in st.session_state:
-#     st.session_state.rag_chain = None
+# [FIX #1]: Initialize conversation memory in session state
+if 'memory' not in st.session_state:
+    st.session_state.memory = ConversationBufferMemory(
+        memory_key="chat_history", return_messages=True, output_key='answer'
+    )
+
+# --- Application Flow ---
 
 if st.session_state.stage == 'search':
     st.header("1. 搜索论文")
+    # ... (Search stage code remains the same)
     query = st.text_input("输入您想搜索的论文关键词", key="search_query")
     if st.button(" C 搜索"):
         if query:
@@ -76,8 +84,10 @@ if st.session_state.stage == 'search':
         else:
             st.warning("请输入搜索关键词。")
 
+
 elif st.session_state.stage == 'select':
     st.header("2. 选择一篇论文进行对话")
+    # ... (Select stage code remains the same)
     if 'search_results' in st.session_state and st.session_state.search_results:
         for paper in st.session_state.search_results:
             st.subheader(paper.title)
@@ -87,47 +97,56 @@ elif st.session_state.stage == 'select':
             if st.button(f" C 与这篇论文对话", key=f"select_{paper_id}"):
                 st.session_state.selected_paper_id = paper_id
                 st.session_state.stage = 'chat'
+                # Clear previous chat history when starting a new conversation
+                st.session_state.messages = []
+                st.session_state.memory.clear()
                 st.rerun()
     if st.button("返回搜索"):
         st.session_state.pop('search_results', None)
         st.session_state.stage = 'search'
         st.rerun()
 
+
 elif st.session_state.stage == 'chat':
     paper_id = st.session_state.selected_paper_id
 
-    # [结构性修复 3]: 构建完整的对话界面
     try:
-        # 1. 获取缓存好的数据处理器（retriever）和元数据
-        with st.spinner("正在准备论文数据..."):
-            retriever, paper_metadata, downloaded_pdf_path = get_retriever_and_metadata(paper_id)
-        st.success("环境准备完成!")
+        # 1. Get cached data processor (retriever) and metadata
+        retriever, paper_metadata, downloaded_pdf_path = get_retriever_and_metadata(paper_id)
 
-        # 2. 在这里，每次进入对话时，都创建一个新的、带有“鲜活”网络连接的LLM和Chain
-        # 这个创建过程非常快，不会影响用户体验
-        repo_id = "Qwen/Qwen1.5-7B-Chat"
+        # 2. Create the LLM object (this is fast)
         llm = HuggingFaceHub(
-            repo_id=repo_id,
+            repo_id="Qwen/Qwen1.5-7B-Chat",
             model_kwargs={"temperature": 0.3, "max_length": 2048}
         )
-        qa_template = """[任务指令]
-        你是一个顶级的AI学术研究员...
-        """
-        QA_PROMPT = PromptTemplate(
-            template=qa_template, input_variables=["context", "question"]
-        )
-        # 为本次对话创建一个新的记忆和RAG链
-        memory = ConversationBufferMemory(
-            memory_key="chat_history", return_messages=True, output_key='answer'
-        )
+        
+        # 3. Create the RAG chain, passing the PERSISTENT memory from session state
+        # [FIX #2]: Use the memory object from st.session_state
         rag_chain = ConversationalRetrievalChain.from_llm(
-            llm=llm, retriever=retriever, memory=memory,
-            combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+            llm=llm,
+            retriever=retriever,
+            memory=st.session_state.memory, # Use the memory from session state
+            combine_docs_chain_kwargs={
+                "prompt": PromptTemplate(
+                    template="""[任务指令]
+                    你是一个顶级的AI学术研究员，你的任务是基于下方提供的“[论文相关内容]”，以一种深刻、专业且富有洞察力的口吻，详细回答用户的“[问题]”。
+                    [知识范围]: 你的所有回答必须严格来源于下方提供的“[论文相关内容]”。绝对禁止使用任何外部知识或进行无根据的猜测。
+                    [约束条件]: 如果内容片段确实无法支撑回答，就直截了当地说：“这篇论文的相关部分未讨论此问题。”
+                    ---
+                    [论文相关内容]: {context}
+                    ---
+                    [问题]: {question}
+                    [你的专家级分析回答]:
+                    """,
+                    input_variables=["context", "question"]
+                )
+            },
             return_source_documents=True
         )
 
-        # 3. 显示对话界面
+        # 4. Display the chat interface
         st.header(f"3. 正在与论文对话: {paper_metadata.title}")
+        # ... (Display code remains the same)
         with open(downloaded_pdf_path, "rb") as pdf_file:
             st.download_button(
                 label="📥 下载当前论文PDF",
@@ -137,37 +156,44 @@ elif st.session_state.stage == 'chat':
             )
         st.divider()
 
-        # 4. 处理对话逻辑
+        # Display previous messages
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
+        # Handle new user input
         user_question = st.chat_input("请就这篇论文提问：")
         if user_question:
+            # Add user message to display list
             st.session_state.messages.append({"role": "user", "content": user_question})
             with st.chat_message("user"):
                 st.markdown(user_question)
 
             with st.spinner("模型正在检索与思考中..."):
-                # 使用刚刚创建的、鲜活的rag_chain
-                result = rag_chain({"question": user_question, "chat_history": st.session_state.messages[:-1]})
+                # [FIX #3]: Call the chain simply. The memory object handles the history automatically.
+                result = rag_chain.invoke({"question": user_question})
                 ai_response = result['answer']
+                
+                # Add AI response to display list
                 st.session_state.messages.append({"role": "assistant", "content": ai_response})
-
+                
+                # Display AI response
                 with st.chat_message("assistant"):
                     st.markdown(ai_response)
                     with st.expander("查看本次回答引用的原文片段"):
                         for doc in result.get('source_documents', []):
-                            st.markdown(
-                                f"> {doc.page_content}\n\n_(来源: PDF 第 {doc.metadata.get('page', 'N/A')} 页)_")
-        
+                            st.markdown(f"> {doc.page_content}\n\n_(来源: PDF 第 {doc.metadata.get('page', 'N/A')} 页)_")
+
         if st.button(" C 返回论文选择列表"):
             st.session_state.stage = 'select'
             st.session_state.messages = []
+            st.session_state.memory.clear() # Clear memory for the next conversation
             st.session_state.pop('selected_paper_id', None)
             st.rerun()
 
     except Exception as e:
-        st.error(f"环境准备失败: {e}")
+        st.error(f"处理对话时发生错误: {e}")
         if st.button("返回重试"):
+            # Clear potentially problematic cached resources before retrying
+            get_retriever_and_metadata.clear()
             st.rerun()
