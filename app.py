@@ -1,7 +1,6 @@
 import streamlit as st
 import os
 import arxiv
-# [Cloud Change]: 导入 HuggingFaceHub 以便通过API调用模型
 from langchain_community.llms import HuggingFaceHub
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -12,23 +11,16 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
 
-# --- 部署准备: 加载环境变量 ---
-# 在本地，这会加载 .env 文件。在Streamlit Cloud上，它会读取您设置的Secrets。
 load_dotenv()
 
-# --- 1. 页面配置 ---
 st.set_page_config(page_title="AI论文搜索与问答机器人", page_icon=" C", layout="wide")
 st.title(" C AI论文搜索与问答机器人")
 st.write("在这里，您可以搜索arXiv上的论文，并与选定的论文进行智能对话。")
 
-# --- 2. 文件夹路径定义 ---
-# 在云端临时文件系统中使用一个简单的文件夹名即可
-PDF_SAVE_PATH = "../project/downloaded_papers"
+PDF_SAVE_PATH = "downloaded_papers"
 if not os.path.exists(PDF_SAVE_PATH):
     os.makedirs(PDF_SAVE_PATH)
 
-
-# --- 3. 核心功能函数 (缓存以提高性能) ---
 @st.cache_resource
 def setup_pipelines(_paper_id):
     print(f"--- 正在为论文 {_paper_id} 构建RAG流水线 ---")
@@ -36,7 +28,7 @@ def setup_pipelines(_paper_id):
     client = arxiv.Client()
     search = arxiv.Search(id_list=[_paper_id])
     paper = next(client.results(search))
-
+    
     pdf_filename = f"{paper.entry_id.split('/')[-1]}.pdf"
     local_pdf_path = os.path.join(PDF_SAVE_PATH, pdf_filename)
     if not os.path.exists(local_pdf_path):
@@ -56,53 +48,32 @@ def setup_pipelines(_paper_id):
     print("--- 正在为论文创建向量索引... ---")
     vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
     print("--- 向量索引创建完成！ ---")
-
+    
     retriever = vectorstore.as_retriever(search_kwargs={'k': 6})
 
-    # ===================================================================
-    # --- START DIAGNOSTIC BLOCK ---
-    # ===================================================================
-    st.info("--- 正在执行LLM初始化诊断 ---")
-
-    # 1. 检查环境变量是否被应用成功读取
-    api_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
-    if api_token:
-        st.success("✅ 诊断 1/3: 成功从Secrets中读取到 HUGGINGFACEHUB_API_TOKEN。")
-        # 为安全起见，只显示部分token
-        st.write(f"Token 片段: `{api_token[:5]}...{api_token[-5:]}`")
-    else:
-        st.error("🚨 诊断 1/3: 关键失败！未能从Secrets中读取到 HUGGINGFACEHUB_API_TOKEN！请检查Secrets的名称拼写。")
-        st.stop()  # 如果没有token，直接停止运行
-
-    # 2. 尝试初始化HuggingFaceHub对象
+    print("--- 正在连接HuggingFace Hub模型: Qwen/Qwen1.5-7B-Chat ---")
     repo_id = "Qwen/Qwen1.5-7B-Chat"
-    llm = None  # 先声明变量
-    try:
-        llm = HuggingFaceHub(
-            repo_id=repo_id,
-            model_kwargs={"temperature": 0.3, "max_length": 2048}
-        )
-        st.success("✅ 诊断 2/3: HuggingFaceHub 对象初始化成功！")
-        st.write(f"LLM 对象类型: `{type(llm)}`")
-    except Exception as e:
-        st.error(f"🚨 诊断 2/3: 关键失败！在初始化 HuggingFaceHub 对象时发生错误: {e}")
-        st.stop()
-
-    # 3. 检查内部客户端是否存在 (AttributeError的直接原因)
-    if hasattr(llm, 'client') and llm.client is not None:
-        st.success("✅ 诊断 3/3: 内部 `llm.client` 对象存在且不为空。")
-    else:
-        st.warning("⚠️ 诊断 3/3: 警告！内部 `llm.client` 对象缺失或为空！这可能是版本不兼容导致的。")
-
-    st.info("--- LLM初始化诊断结束 ---")
-    # ===================================================================
-    # --- END DIAGNOSTIC BLOCK ---
-    # ===================================================================
-
+    llm = HuggingFaceHub(
+        repo_id=repo_id,
+        model_kwargs={"temperature": 0.3, "max_length": 2048}
+    )
+    print("--- 成功连接到HuggingFace Hub模型 ---")
+    
     qa_template = """[任务指令]
-    你是一个顶级的AI学术研究员...
-    """  # (模板内容保持不变)
-    QA_PROMPT = PromptTemplate.from_template(qa_template)
+    你是一个顶级的AI学术研究员，你的任务是基于下方提供的“[论文相关内容]”，以一种深刻、专业且富有洞察力的口吻，详细回答用户的“[问题]”。
+    [知识范围]: 你的所有回答必须严格来源于下方提供的“[论文相关内容]”。绝对禁止使用任何外部知识或进行无根据的猜测。
+    [约束条件]: 如果内容片段确实无法支撑回答，就直截了当地说：“这篇论文的相关部分未讨论此问题。”
+    ---
+    [论文相关内容]: {context}
+    ---
+    [问题]: {question}
+    [你的专家级分析回答]:
+    """
+    
+    # 【最终修正点】: 明确地告诉PromptTemplate它需要哪些输入变量
+    QA_PROMPT = PromptTemplate(
+        template=qa_template, input_variables=["context", "question"]
+    )
 
     memory = ConversationBufferMemory(
         memory_key="chat_history", return_messages=True, output_key='answer'
@@ -117,7 +88,7 @@ def setup_pipelines(_paper_id):
     print("--- RAG流水线构建完成 ---")
     return rag_chain
 
-# --- Session State and App Flow (这部分代码和您本地成功运行的版本完全一样，无需改动) ---
+# --- Session State and App Flow (无需改动) ---
 if 'stage' not in st.session_state:
     st.session_state.stage = 'search'
 if 'messages' not in st.session_state:
@@ -166,20 +137,9 @@ elif st.session_state.stage == 'chat':
     if st.session_state.rag_chain is None:
         with st.status(f"正在准备与论文 {paper_id} 的对话环境...", expanded=True) as status:
             try:
-                status.write(" C 正在下载论文PDF...")
-                client = arxiv.Client()
-                search = arxiv.Search(id_list=[paper_id])
-                paper_metadata = next(client.results(search))
-                pdf_filename = f"{paper_metadata.entry_id.split('/')[-1]}.pdf"
-                downloaded_pdf_path = os.path.join(PDF_SAVE_PATH, pdf_filename)
-                if not os.path.exists(downloaded_pdf_path):
-                    paper_metadata.download_pdf(dirpath=PDF_SAVE_PATH, filename=pdf_filename)
-                st.session_state.paper_metadata = paper_metadata
-                st.session_state.downloaded_pdf_path = downloaded_pdf_path
-
-                status.write(f" C 正在构建RAG流水线...")
+                # 注意：在下一次运行时，您之前添加的诊断代码可以被安全地移除，
+                # 但保留它们也无妨。为简洁，此版本已移除诊断块。
                 st.session_state.rag_chain = setup_pipelines(paper_id)
-
                 status.update(label=" C 环境准备完成！", state="complete", expanded=False)
 
             except Exception as e:
