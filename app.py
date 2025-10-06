@@ -11,19 +11,23 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
 
+# Load environment variables. On Streamlit Cloud, this reads from Secrets.
 load_dotenv()
 
+# --- 1. Page Configuration ---
 st.set_page_config(page_title="AI论文搜索与问答机器人", page_icon=" C", layout="wide")
 st.title(" C AI论文搜索与问答机器人")
 st.write("在这里，您可以搜索arXiv上的论文，并与选定的论文进行智能对话。")
 
+# --- 2. Directory Path Definition ---
 PDF_SAVE_PATH = "downloaded_papers"
 if not os.path.exists(PDF_SAVE_PATH):
     os.makedirs(PDF_SAVE_PATH)
 
+# --- 3. Core Function (Cached to improve performance) ---
 @st.cache_resource
 def setup_pipelines(_paper_id):
-    print(f"--- 正在为论文 {_paper_id} 构建RAG流水线 ---")
+    print(f"--- Building RAG pipeline for paper {_paper_id} ---")
 
     client = arxiv.Client()
     search = arxiv.Search(id_list=[_paper_id])
@@ -33,10 +37,10 @@ def setup_pipelines(_paper_id):
     local_pdf_path = os.path.join(PDF_SAVE_PATH, pdf_filename)
     if not os.path.exists(local_pdf_path):
         paper.download_pdf(dirpath=PDF_SAVE_PATH, filename=pdf_filename)
-    print(f"--- 论文PDF '{pdf_filename}' 已就绪 ---")
-
+    
     embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
     embeddings = SentenceTransformerEmbeddings(model_name=embedding_model_name)
+    
     loader = PyMuPDFLoader(local_pdf_path)
     docs = loader.load()
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -44,6 +48,7 @@ def setup_pipelines(_paper_id):
 
     vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={'k': 6})
+    
     repo_id = "Qwen/Qwen1.5-7B-Chat"
     llm = HuggingFaceHub(
         repo_id=repo_id,
@@ -51,8 +56,17 @@ def setup_pipelines(_paper_id):
     )
     
     qa_template = """[任务指令]
-    你是一个顶级的AI学术研究员...
+    你是一个顶级的AI学术研究员，你的任务是基于下方提供的“[论文相关内容]”，以一种深刻、专业且富有洞察力的口吻，详细回答用户的“[问题]”。
+    [知识范围]: 你的所有回答必须严格来源于下方提供的“[论文相关内容]”。绝对禁止使用任何外部知识或进行无根据的猜测。
+    [约束条件]: 如果内容片段确实无法支撑回答，就直截了当地说：“这篇论文的相关部分未讨论此问题。”
+    ---
+    [论文相关内容]: {context}
+    ---
+    [问题]: {question}
+    [你的专家级分析回答]:
     """
+    
+    # [FIX #1]: Explicitly define input variables for the PromptTemplate.
     QA_PROMPT = PromptTemplate(
         template=qa_template, input_variables=["context", "question"]
     )
@@ -67,12 +81,12 @@ def setup_pipelines(_paper_id):
         return_source_documents=True
     )
 
-    print("--- RAG流水线构建完成 ---")
+    print("--- RAG pipeline built successfully ---")
     
-    # 【最终修正点 1】: 返回所有需要的信息，而不仅仅是chain
+    # [FIX #2]: Return all necessary information from the function.
     return rag_chain, paper, local_pdf_path
 
-# --- Session State and App Flow (无需改动) ---
+# --- Session State and App Flow ---
 if 'stage' not in st.session_state:
     st.session_state.stage = 'search'
 if 'messages' not in st.session_state:
@@ -121,7 +135,7 @@ elif st.session_state.stage == 'chat':
     if st.session_state.rag_chain is None:
         with st.status(f"正在准备与论文 {paper_id} 的对话环境...", expanded=True) as status:
             try:
-                # 【最终修正点 2】: 接收所有返回值，并全部存入session_state
+                # [FIX #2]: Receive all return values and store them in the session state.
                 rag_chain, paper_metadata, downloaded_pdf_path = setup_pipelines(paper_id)
                 st.session_state.rag_chain = rag_chain
                 st.session_state.paper_metadata = paper_metadata
