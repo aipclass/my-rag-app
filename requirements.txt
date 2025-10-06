@@ -8,6 +8,7 @@ langchain-huggingface==0.0.3
 huggingface-hub
 arxiv
 PyMuPDF
+langchain-glm
 faiss-cpu
 sentence-transformers
 python-dotenv
