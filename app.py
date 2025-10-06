@@ -13,7 +13,7 @@ except Exception:
 # --- LangChain 核心组件 ---
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
@@ -147,9 +147,8 @@ def get_retriever_and_metadata(_paper_id):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     splits = text_splitter.split_documents(docs)
 
-    # 3. 向量化并创建FAISS索引
-    embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
-    embeddings = SentenceTransformerEmbeddings(model_name=embedding_model_name)
+    # 3. 向量化并创建FAISS索引（改为 fastembed，避免安装大型PyTorch 依赖）
+    embeddings = FastEmbedEmbeddings()
     vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
 
     # 4. 创建检索器
