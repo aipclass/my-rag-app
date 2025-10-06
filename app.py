@@ -4,11 +4,11 @@ import arxiv
 from dotenv import load_dotenv
 import requests
 
-# --- 尝试导入智谱AI模型；若不可用，将在运行时自动回退到 Hugging Face 免费模型 ---
+# --- 直接用官方 SDK（zhipuai>=2.x），不再依赖 langchain_glm 以减少安装问题 ---
 try:
-    from langchain_glm import ChatZhipuAI  # type: ignore
+    from zhipuai import ZhipuAI  # type: ignore
 except Exception:
-    ChatZhipuAI = None  # 延迟回退
+    ZhipuAI = None
 
 # --- LangChain 核心组件 ---
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -215,20 +215,36 @@ elif st.session_state.stage == 'chat':
     try:
         retriever, paper_metadata, downloaded_pdf_path = get_retriever_and_metadata(paper_id)
 
-        # --- 优先使用智谱AI；若包或密钥不可用则自动回退至HF免费模型 ---
+        # --- 优先使用智谱AI（官方 SDK + 简单适配器）；若不可用则回退 HF 免费模型 ---
         llm = None
+        current_model_label = ""
         zhipuai_api_key = os.getenv("ZHIPUAI_API_KEY")
         zhipu_model = os.getenv("ZHIPU_MODEL", "glm-4-flash")
-        if ChatZhipuAI is not None and zhipuai_api_key:
-            try:
-                llm = ChatZhipuAI(
-                    model=zhipu_model,
-                    temperature=0.3,
-                    api_key=zhipuai_api_key
-                )
-                current_model_label = f"ZhipuAI {zhipu_model}"
-            except Exception as _:
-                llm = None
+        if ZhipuAI is not None and zhipuai_api_key:
+            class ZhipuLLMAdapter(LLM):
+                model: str
+                api_key: str
+                temperature: float = 0.3
+
+                @property
+                def _llm_type(self) -> str:
+                    return "zhipu-adapter"
+
+                def _call(self, prompt: str, stop=None, run_manager=None, **kwargs):
+                    client = ZhipuAI(api_key=self.api_key)
+                    resp = client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=self.temperature,
+                    )
+                    # 兼容 SDK 返回
+                    try:
+                        return resp.choices[0].message.content  # type: ignore
+                    except Exception:
+                        return str(resp)
+
+            llm = ZhipuLLMAdapter(model=zhipu_model, api_key=zhipuai_api_key, temperature=0.3)
+            current_model_label = f"ZhipuAI {zhipu_model}"
         if llm is None:
             # 回退：使用HF免费模型
             selected_model = os.getenv("HF_MODEL_ID", "google/flan-t5-base")
