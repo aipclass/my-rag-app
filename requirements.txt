@@ -1,9 +1,13 @@
 streamlit
-langchain
-langchain-community
-arxiv
-pymupdf
-sentence-transformers
-faiss-cpu
-python-dotenv
+# Pinning LangChain versions for stability
+langchain==0.2.1
+langchain-core==0.2.3
+langchain-community==0.2.1
+# Add the new, recommended package for Hugging Face endpoints
+langchain-huggingface==0.0.3
 huggingface-hub
+arxiv
+PyMuPDF
+faiss-cpu
+sentence-transformers
+python-dotenv
