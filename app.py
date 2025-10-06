@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+from langchain_glm import ChatZhipuAI
 import arxiv
 import requests
 # [最终修复 1]: 导入官方推荐的 HuggingFaceEndpoint 替代 HuggingFaceHub
@@ -221,16 +222,11 @@ elif st.session_state.stage == 'chat':
         # 使用自定义的 HF Inference API 包装器以规避 InferenceClient.post 兼容性问题
         # 允许通过环境变量 HF_MODEL_ID 覆盖默认模型；默认选择更易于在免费Inference API上可用的较小模型
         selected_model = os.getenv("HF_MODEL_ID", "google/flan-t5-base")
-        llm = HfInferenceLLM(
-            repo_id=selected_model,
-            temperature=0.3,
-            max_new_tokens=2048,
-            fallback_models=[
-                "google/flan-t5-base",
-                "google/flan-t5-small",
-                "google/flan-t5-large",
-            ]
-        )
+       llm = ChatZhipuAI(
+    model="glm-4",  # 使用最新的GLM-4模型
+    temperature=0.3,
+    api_key=os.getenv("ZHIPUAI_API_KEY") # 从Secrets中读取Key
+)
 
         rag_chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
@@ -300,3 +296,4 @@ elif st.session_state.stage == 'chat':
         if st.button("返回重试"):
             get_retriever_and_metadata.clear()
             st.rerun()
+
