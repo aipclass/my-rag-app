@@ -68,8 +68,6 @@ def setup_pipelines(_paper_id):
     llm = HuggingFaceHub(
         repo_id=repo_id,
         model_kwargs={"temperature": 0.3, "max_length": 2048},
-        # 从环境变量安全地读取API Token，这是云部署的最佳实践
-        huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN")
     )
     print("--- 成功连接到HuggingFace Hub模型 ---")
 
@@ -214,4 +212,5 @@ elif st.session_state.stage == 'chat':
         st.session_state.pop('selected_paper_id', None)
         st.session_state.pop('paper_metadata', None)
         st.session_state.pop('downloaded_pdf_path', None)
+
         st.rerun()
