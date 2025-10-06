@@ -9,8 +9,9 @@ huggingface-hub
 arxiv
 PyMuPDF
 faiss-cpu
-sentence-transformers
 python-dotenv
 langchain-glm>=0.1.5
 zhipuai>=2.0.0
 requests
+fastembed>=0.2.7
+numpy<2
