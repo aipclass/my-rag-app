@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import arxiv
+import requests
 # [最终修复 1]: 导入官方推荐的 HuggingFaceEndpoint 替代 HuggingFaceHub
 from langchain_huggingface import HuggingFaceEndpoint
 from dotenv import load_dotenv
@@ -11,9 +12,82 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
+from langchain_core.language_models.llms import LLM
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from typing import List, Optional, Any
 
 # Load environment variables. On Streamlit Cloud, this reads from Secrets.
 load_dotenv()
+
+# --- 0. Minimal HF Inference API LLM Wrapper (to avoid InferenceClient.post issues) ---
+class HfInferenceLLM(LLM):
+    """Lightweight LLM using Hugging Face Inference API via requests.
+
+    This avoids version-mismatch issues around huggingface_hub's InferenceClient.post.
+    """
+
+    repo_id: str
+    temperature: float = 0.3
+    max_new_tokens: int = 2048
+    timeout: float = 60.0
+
+    @property
+    def _llm_type(self) -> str:
+        return "hf-inference-api"
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        if not token:
+            raise RuntimeError(
+                "Missing HUGGINGFACEHUB_API_TOKEN. Please set it in environment/Secrets."
+            )
+
+        url = f"https://api-inference.huggingface.co/models/{self.repo_id}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "temperature": self.temperature,
+                "max_new_tokens": self.max_new_tokens,
+                "return_full_text": False,
+            },
+            "options": {"wait_for_model": True},
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"HF Inference API request failed: {e}")
+
+        try:
+            data = resp.json()
+        except Exception:
+            return resp.text
+
+        # HF responses could be list[{'generated_text': ...}] or dict with error
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            text = data[0].get("generated_text")
+            if text is not None:
+                return text
+        if isinstance(data, dict):
+            # Some models return {'generated_text': '...'} directly
+            if "generated_text" in data:
+                return str(data["generated_text"])  # type: ignore
+            if "error" in data:
+                raise RuntimeError(f"HF Inference API error: {data['error']}")
+
+        # Fallback to best-effort string conversion
+        return str(data)
 
 # --- 1. Page Configuration ---
 st.set_page_config(page_title="AI论文搜索与问答机器人", page_icon=" C", layout="wide")
@@ -25,6 +99,7 @@ PDF_SAVE_PATH = "downloaded_papers"
 if not os.path.exists(PDF_SAVE_PATH):
     os.makedirs(PDF_SAVE_PATH)
 
+
 # --- 3. Cached Data Processing Function ---
 @st.cache_resource
 def get_retriever_and_metadata(_paper_id):
@@ -32,15 +107,15 @@ def get_retriever_and_metadata(_paper_id):
     client = arxiv.Client()
     search = arxiv.Search(id_list=[_paper_id])
     paper = next(client.results(search))
-    
+
     pdf_filename = f"{paper.entry_id.split('/')[-1]}.pdf"
     local_pdf_path = os.path.join(PDF_SAVE_PATH, pdf_filename)
     if not os.path.exists(local_pdf_path):
         paper.download_pdf(dirpath=PDF_SAVE_PATH, filename=pdf_filename)
-    
+
     embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
     embeddings = SentenceTransformerEmbeddings(model_name=embedding_model_name)
-    
+
     loader = PyMuPDFLoader(local_pdf_path)
     docs = loader.load()
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -50,6 +125,7 @@ def get_retriever_and_metadata(_paper_id):
     retriever = vectorstore.as_retriever(search_kwargs={'k': 6})
 
     return retriever, paper, local_pdf_path
+
 
 # --- Session State Initialization ---
 if 'stage' not in st.session_state:
@@ -106,15 +182,13 @@ elif st.session_state.stage == 'chat':
     try:
         retriever, paper_metadata, downloaded_pdf_path = get_retriever_and_metadata(paper_id)
 
-        # [最终修复 2]: 使用 HuggingFaceEndpoint 替代 HuggingFaceHub
-        # 它更现代，且能正确处理新版 huggingface_hub 库
-        llm = HuggingFaceEndpoint(
+        # 使用自定义的 HF Inference API 包装器以规避 InferenceClient.post 兼容性问题
+        llm = HfInferenceLLM(
             repo_id="Qwen/Qwen1.5-7B-Chat",
             temperature=0.3,
             max_new_tokens=2048,
-            # 它会自动从环境变量(Secrets)中读取HUGGINGFACEHUB_API_TOKEN
         )
-        
+
         rag_chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
             retriever=retriever,
@@ -160,14 +234,15 @@ elif st.session_state.stage == 'chat':
             with st.spinner("模型正在检索与思考中..."):
                 result = rag_chain.invoke({"question": user_question})
                 ai_response = result['answer']
-                
+
                 st.session_state.messages.append({"role": "assistant", "content": ai_response})
-                
+
                 with st.chat_message("assistant"):
                     st.markdown(ai_response)
                     with st.expander("查看本次回答引用的原文片段"):
                         for doc in result.get('source_documents', []):
-                            st.markdown(f"> {doc.page_content}\n\n_(来源: PDF 第 {doc.metadata.get('page', 'N/A')} 页)_")
+                            st.markdown(
+                                f"> {doc.page_content}\n\n_(来源: PDF 第 {doc.metadata.get('page', 'N/A')} 页)_")
 
         if st.button(" C 返回论文选择列表"):
             st.session_state.stage = 'select'
