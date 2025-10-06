@@ -36,41 +36,23 @@ def setup_pipelines(_paper_id):
     print(f"--- 论文PDF '{pdf_filename}' 已就绪 ---")
 
     embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
-    print(f"--- 正在从Hub加载Embedding模型: {embedding_model_name} ---")
     embeddings = SentenceTransformerEmbeddings(model_name=embedding_model_name)
-    print("--- Embedding模型加载完毕 ---")
-
     loader = PyMuPDFLoader(local_pdf_path)
     docs = loader.load()
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     splits = text_splitter.split_documents(docs)
 
-    print("--- 正在为论文创建向量索引... ---")
     vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
-    print("--- 向量索引创建完成！ ---")
-    
     retriever = vectorstore.as_retriever(search_kwargs={'k': 6})
-
-    print("--- 正在连接HuggingFace Hub模型: Qwen/Qwen1.5-7B-Chat ---")
     repo_id = "Qwen/Qwen1.5-7B-Chat"
     llm = HuggingFaceHub(
         repo_id=repo_id,
         model_kwargs={"temperature": 0.3, "max_length": 2048}
     )
-    print("--- 成功连接到HuggingFace Hub模型 ---")
     
     qa_template = """[任务指令]
-    你是一个顶级的AI学术研究员，你的任务是基于下方提供的“[论文相关内容]”，以一种深刻、专业且富有洞察力的口吻，详细回答用户的“[问题]”。
-    [知识范围]: 你的所有回答必须严格来源于下方提供的“[论文相关内容]”。绝对禁止使用任何外部知识或进行无根据的猜测。
-    [约束条件]: 如果内容片段确实无法支撑回答，就直截了当地说：“这篇论文的相关部分未讨论此问题。”
-    ---
-    [论文相关内容]: {context}
-    ---
-    [问题]: {question}
-    [你的专家级分析回答]:
+    你是一个顶级的AI学术研究员...
     """
-    
-    # 【最终修正点】: 明确地告诉PromptTemplate它需要哪些输入变量
     QA_PROMPT = PromptTemplate(
         template=qa_template, input_variables=["context", "question"]
     )
@@ -86,7 +68,9 @@ def setup_pipelines(_paper_id):
     )
 
     print("--- RAG流水线构建完成 ---")
-    return rag_chain
+    
+    # 【最终修正点 1】: 返回所有需要的信息，而不仅仅是chain
+    return rag_chain, paper, local_pdf_path
 
 # --- Session State and App Flow (无需改动) ---
 if 'stage' not in st.session_state:
@@ -98,7 +82,7 @@ if 'rag_chain' not in st.session_state:
 
 if st.session_state.stage == 'search':
     st.header("1. 搜索论文")
-    query = st.text_input("输入您想搜索的论文关键词 (例如: 'large language model')", key="search_query")
+    query = st.text_input("输入您想搜索的论文关键词", key="search_query")
     if st.button(" C 搜索"):
         if query:
             with st.spinner("正在arXiv上搜索..."):
@@ -137,9 +121,12 @@ elif st.session_state.stage == 'chat':
     if st.session_state.rag_chain is None:
         with st.status(f"正在准备与论文 {paper_id} 的对话环境...", expanded=True) as status:
             try:
-                # 注意：在下一次运行时，您之前添加的诊断代码可以被安全地移除，
-                # 但保留它们也无妨。为简洁，此版本已移除诊断块。
-                st.session_state.rag_chain = setup_pipelines(paper_id)
+                # 【最终修正点 2】: 接收所有返回值，并全部存入session_state
+                rag_chain, paper_metadata, downloaded_pdf_path = setup_pipelines(paper_id)
+                st.session_state.rag_chain = rag_chain
+                st.session_state.paper_metadata = paper_metadata
+                st.session_state.downloaded_pdf_path = downloaded_pdf_path
+                
                 status.update(label=" C 环境准备完成！", state="complete", expanded=False)
 
             except Exception as e:
