@@ -1,11 +1,12 @@
 import streamlit as st
 import os
-from langchain_glm import ChatZhipuAI
 import arxiv
-import requests
-# [最终修复 1]: 导入官方推荐的 HuggingFaceEndpoint 替代 HuggingFaceHub
-from langchain_huggingface import HuggingFaceEndpoint
 from dotenv import load_dotenv
+
+# --- 核心修改 1: 导入智谱AI的模型 ---
+from langchain_glm import ChatZhipuAI
+
+# --- LangChain 核心组件 ---
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import SentenceTransformerEmbeddings
@@ -13,158 +14,60 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
-from langchain_core.language_models.llms import LLM
-from langchain_core.callbacks import CallbackManagerForLLMRun
-from typing import List, Optional, Any
 
-# Load environment variables. On Streamlit Cloud, this reads from Secrets.
+
+# 加载环境变量 (在Streamlit Cloud上会自动读取Secrets)
 load_dotenv()
 
-# --- 0. Minimal HF Inference API LLM Wrapper (to avoid InferenceClient.post issues) ---
-class HfInferenceLLM(LLM):
-    """Lightweight LLM using Hugging Face Inference API via requests.
-
-    This avoids version-mismatch issues around huggingface_hub's InferenceClient.post.
-    """
-
-    repo_id: str
-    temperature: float = 0.3
-    max_new_tokens: int = 2048
-    timeout: float = 60.0
-    fallback_models: Optional[List[str]] = None
-
-    @property
-    def _llm_type(self) -> str:
-        return "hf-inference-api"
-
-    def _call(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs: Any,
-    ) -> str:
-        token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
-        if not token:
-            raise RuntimeError(
-                "Missing HUGGINGFACEHUB_API_TOKEN. Please set it in environment/Secrets."
-            )
-
-        url = f"https://api-inference.huggingface.co/models/{self.repo_id}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "temperature": self.temperature,
-                "max_new_tokens": self.max_new_tokens,
-                "return_full_text": False,
-            },
-            "options": {"wait_for_model": True},
-        }
-
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-            if resp.status_code == 404:
-                # 自动回退到常用可用模型（可通过环境变量 HF_FALLBACK_MODELS 覆盖）
-                fallback_env = os.getenv("HF_FALLBACK_MODELS")
-                fallbacks = (
-                    [m.strip() for m in fallback_env.split(",") if m.strip()]
-                    if fallback_env
-                    else (self.fallback_models
-                          or [
-                              "google/flan-t5-base",
-                              "google/flan-t5-small",
-                              "google/flan-t5-large",
-                          ])
-                )
-                for fb in fallbacks:
-                    fb_url = f"https://api-inference.huggingface.co/models/{fb}"
-                    fb_resp = requests.post(fb_url, headers=headers, json=payload, timeout=self.timeout)
-                    if fb_resp.ok:
-                        # 切换当前模型为成功的回退模型
-                        self.repo_id = fb
-                        try:
-                            data = fb_resp.json()
-                            if isinstance(data, list) and data and isinstance(data[0], dict):
-                                text = data[0].get("generated_text")
-                                if text is not None:
-                                    return text
-                            if isinstance(data, dict) and "generated_text" in data:
-                                return str(data["generated_text"])  # type: ignore
-                            return str(data)
-                        except Exception:
-                            return fb_resp.text
-                raise RuntimeError(
-                    "HF Inference API 404: 选定模型不可用，且所有回退模型均失败。"
-                )
-            if resp.status_code == 429:
-                raise RuntimeError("HF Inference API 429: 触发频率限制，请稍后重试。")
-            resp.raise_for_status()
-        except Exception as e:
-            raise RuntimeError(f"HF Inference API request failed: {e}")
-
-        try:
-            data = resp.json()
-        except Exception:
-            return resp.text
-
-        # HF responses could be list[{'generated_text': ...}] or dict with error
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            text = data[0].get("generated_text")
-            if text is not None:
-                return text
-        if isinstance(data, dict):
-            # Some models return {'generated_text': '...'} directly
-            if "generated_text" in data:
-                return str(data["generated_text"])  # type: ignore
-            if "error" in data:
-                raise RuntimeError(f"HF Inference API error: {data['error']}")
-
-        # Fallback to best-effort string conversion
-        return str(data)
-
-# --- 1. Page Configuration ---
+# --- 1. 页面配置 ---
 st.set_page_config(page_title="AI论文搜索与问答机器人", page_icon=" C", layout="wide")
 st.title(" C AI论文搜索与问答机器人")
 st.write("在这里，您可以搜索arXiv上的论文，并与选定的论文进行智能对话。")
 
-# --- 2. Directory Path Definition ---
+# --- 2. 定义路径 ---
 PDF_SAVE_PATH = "downloaded_papers"
 if not os.path.exists(PDF_SAVE_PATH):
     os.makedirs(PDF_SAVE_PATH)
 
-
-# --- 3. Cached Data Processing Function ---
+# --- 3. 缓存的数据处理函数 (核心功能不变) ---
 @st.cache_resource
 def get_retriever_and_metadata(_paper_id):
-    print(f"--- [Cache Miss] Building retriever for paper {_paper_id} ---")
+    """
+    下载论文PDF，加载、切分、向量化，并创建检索器。
+    利用Streamlit的缓存避免重复计算。
+    """
+    print(f"--- [Cache Miss] 正在为论文 {_paper_id} 构建检索器 ---")
     client = arxiv.Client()
     search = arxiv.Search(id_list=[_paper_id])
     paper = next(client.results(search))
 
     pdf_filename = f"{paper.entry_id.split('/')[-1]}.pdf"
     local_pdf_path = os.path.join(PDF_SAVE_PATH, pdf_filename)
+
+    # 如果本地不存在PDF，则下载
     if not os.path.exists(local_pdf_path):
         paper.download_pdf(dirpath=PDF_SAVE_PATH, filename=pdf_filename)
 
-    embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
-    embeddings = SentenceTransformerEmbeddings(model_name=embedding_model_name)
-
+    # 1. 加载文档
     loader = PyMuPDFLoader(local_pdf_path)
     docs = loader.load()
+
+    # 2. 切分文档
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     splits = text_splitter.split_documents(docs)
 
+    # 3. 向量化并创建FAISS索引
+    embedding_model_name = "sentence-transformers/all-MiniLM-L6-v2"
+    embeddings = SentenceTransformerEmbeddings(model_name=embedding_model_name)
     vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
+
+    # 4. 创建检索器
     retriever = vectorstore.as_retriever(search_kwargs={'k': 6})
 
     return retriever, paper, local_pdf_path
 
 
-# --- Session State Initialization ---
+# --- Session State 初始化 ---
 if 'stage' not in st.session_state:
     st.session_state.stage = 'search'
 if 'messages' not in st.session_state:
@@ -174,8 +77,9 @@ if 'memory' not in st.session_state:
         memory_key="chat_history", return_messages=True, output_key='answer'
     )
 
-# --- Application Flow ---
+# --- 应用流程控制 ---
 
+# ================= 阶段1: 搜索论文 =================
 if st.session_state.stage == 'search':
     st.header("1. 搜索论文")
     query = st.text_input("输入您想搜索的论文关键词", key="search_query")
@@ -194,6 +98,7 @@ if st.session_state.stage == 'search':
         else:
             st.warning("请输入搜索关键词。")
 
+# ================= 阶段2: 选择论文 =================
 elif st.session_state.stage == 'select':
     st.header("2. 选择一篇论文进行对话")
     if 'search_results' in st.session_state and st.session_state.search_results:
@@ -213,21 +118,27 @@ elif st.session_state.stage == 'select':
         st.session_state.stage = 'search'
         st.rerun()
 
+# ================= 阶段3: 与论文对话 =================
 elif st.session_state.stage == 'chat':
     paper_id = st.session_state.selected_paper_id
 
     try:
         retriever, paper_metadata, downloaded_pdf_path = get_retriever_and_metadata(paper_id)
 
-        # 使用自定义的 HF Inference API 包装器以规避 InferenceClient.post 兼容性问题
-        # 允许通过环境变量 HF_MODEL_ID 覆盖默认模型；默认选择更易于在免费Inference API上可用的较小模型
-        selected_model = os.getenv("HF_MODEL_ID", "google/flan-t5-base")
-       llm = ChatZhipuAI(
-    model="glm-4",  # 使用最新的GLM-4模型
-    temperature=0.3,
-    api_key=os.getenv("ZHIPUAI_API_KEY") # 从Secrets中读取Key
-)
+        # --- 核心修改 2: 初始化智谱AI的LLM ---
+        # 确保您已在Streamlit Secrets中设置了 ZHIPUAI_API_KEY
+        zhipuai_api_key = os.getenv("ZHIPUAI_API_KEY")
+        if not zhipuai_api_key:
+            st.error("错误: 请在Streamlit Secrets中设置 ZHIPUAI_API_KEY。")
+            st.stop()
+        
+        llm = ChatZhipuAI(
+            model="glm-4",
+            temperature=0.3,
+            api_key=zhipuai_api_key
+        )
 
+        # 创建对话检索链 (后续逻辑不变)
         rag_chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
             retriever=retriever,
@@ -250,8 +161,12 @@ elif st.session_state.stage == 'chat':
             return_source_documents=True
         )
 
+        # --- 聊天界面 ---
         st.header(f"3. 正在与论文对话: {paper_metadata.title}")
-        st.caption(f"当前模型: {selected_model}")
+
+        # --- 核心修改 3: 更新UI上显示的当前模型名称 ---
+        st.caption("当前模型: ZhipuAI GLM-4")
+        
         with open(downloaded_pdf_path, "rb") as pdf_file:
             st.download_button(
                 label="📥 下载当前论文PDF",
@@ -261,22 +176,26 @@ elif st.session_state.stage == 'chat':
             )
         st.divider()
 
+        # 显示历史消息
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
+        # 接收用户输入
         user_question = st.chat_input("请就这篇论文提问：")
         if user_question:
             st.session_state.messages.append({"role": "user", "content": user_question})
             with st.chat_message("user"):
                 st.markdown(user_question)
 
+            # 调用RAG链获取回答
             with st.spinner("模型正在检索与思考中..."):
                 result = rag_chain.invoke({"question": user_question})
                 ai_response = result['answer']
 
                 st.session_state.messages.append({"role": "assistant", "content": ai_response})
 
+                # 显示AI回答和引用的原文
                 with st.chat_message("assistant"):
                     st.markdown(ai_response)
                     with st.expander("查看本次回答引用的原文片段"):
@@ -284,6 +203,7 @@ elif st.session_state.stage == 'chat':
                             st.markdown(
                                 f"> {doc.page_content}\n\n_(来源: PDF 第 {doc.metadata.get('page', 'N/A')} 页)_")
 
+        # 返回按钮
         if st.button(" C 返回论文选择列表"):
             st.session_state.stage = 'select'
             st.session_state.messages = []
@@ -294,6 +214,6 @@ elif st.session_state.stage == 'chat':
     except Exception as e:
         st.error(f"处理对话时发生错误: {e}")
         if st.button("返回重试"):
+            # 清理缓存并重试
             get_retriever_and_metadata.clear()
             st.rerun()
-
