@@ -22,9 +22,9 @@ from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from typing import List, Optional, Any
 
-
 # 加载环境变量 (在Streamlit Cloud上会自动读取Secrets)
 load_dotenv()
+
 
 # --- 0. 最小HF Inference API封装：作为智谱不可用时的自动回退 ---
 class HfInferenceLLM(LLM):
@@ -39,11 +39,11 @@ class HfInferenceLLM(LLM):
         return "hf-inference-api"
 
     def _call(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs: Any,
+            self,
+            prompt: str,
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[CallbackManagerForLLMRun] = None,
+            **kwargs: Any,
     ) -> str:
         token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
         if not token:
@@ -110,6 +110,7 @@ class HfInferenceLLM(LLM):
                 raise RuntimeError(f"HF Inference API error: {data['error']}")
         return str(data)
 
+
 # --- 1. 页面配置 ---
 st.set_page_config(page_title="AI论文搜索与问答机器人", page_icon=" C", layout="wide")
 st.title(" C AI论文搜索与问答机器人")
@@ -119,6 +120,7 @@ st.write("在这里，您可以搜索arXiv上的论文，并与选定的论文�
 PDF_SAVE_PATH = "downloaded_papers"
 if not os.path.exists(PDF_SAVE_PATH):
     os.makedirs(PDF_SAVE_PATH)
+
 
 # --- 3. 缓存的数据处理函数 (核心功能不变) ---
 @st.cache_resource
@@ -167,6 +169,13 @@ if 'memory' not in st.session_state:
         memory_key="chat_history", return_messages=True, output_key='answer'
     )
 
+# --- 选择论文的回调，避免循环变量绑定问题，确保点击哪一项就进入哪一项 ---
+def _on_select_paper(paper_id: str) -> None:
+    st.session_state.selected_paper_id = paper_id
+    st.session_state.stage = 'chat'
+    st.session_state.messages = []
+    st.session_state.memory.clear()
+
 # --- 应用流程控制 ---
 
 # ================= 阶段1: 搜索论文 =================
@@ -192,17 +201,18 @@ if st.session_state.stage == 'search':
 elif st.session_state.stage == 'select':
     st.header("2. 选择一篇论文进行对话")
     if 'search_results' in st.session_state and st.session_state.search_results:
-        for paper in st.session_state.search_results:
+        # 使用可预测的 key 与 on_click 回调，避免 for 循环闭包导致始终取第一项
+        for idx, paper in enumerate(st.session_state.search_results):
+            paper_id = paper.entry_id.split('/')[-1]
             st.subheader(paper.title)
             st.write(f"**作者**: {', '.join(author.name for author in paper.authors)}")
             st.write(f"**摘要**: {paper.summary[:300]}...")
-            paper_id = paper.entry_id.split('/')[-1]
-            if st.button(f" C 与这篇论文对话", key=f"select_{paper_id}"):
-                st.session_state.selected_paper_id = paper_id
-                st.session_state.stage = 'chat'
-                st.session_state.messages = []
-                st.session_state.memory.clear()
-                st.rerun()
+            st.button(
+                " C 与这篇论文对话",
+                key=f"select_btn_{idx}_{paper_id}",
+                on_click=_on_select_paper,
+                kwargs={"paper_id": paper_id},
+            )
     if st.button("返回搜索"):
         st.session_state.pop('search_results', None)
         st.session_state.stage = 'search'
@@ -210,7 +220,13 @@ elif st.session_state.stage == 'select':
 
 # ================= 阶段3: 与论文对话 =================
 elif st.session_state.stage == 'chat':
-    paper_id = st.session_state.selected_paper_id
+    paper_id = st.session_state.get('selected_paper_id')
+    if not paper_id:
+        st.warning("未检测到已选择的论文，请先返回列表重新选择。")
+        if st.button("返回论文列表"):
+            st.session_state.stage = 'select'
+            st.rerun()
+        st.stop()
 
     try:
         retriever, paper_metadata, downloaded_pdf_path = get_retriever_and_metadata(paper_id)
@@ -242,6 +258,7 @@ elif st.session_state.stage == 'chat':
                         return resp.choices[0].message.content  # type: ignore
                     except Exception:
                         return str(resp)
+
 
             llm = ZhipuLLMAdapter(model=zhipu_model, api_key=zhipuai_api_key, temperature=0.3)
             current_model_label = f"ZhipuAI {zhipu_model}"
@@ -288,7 +305,7 @@ elif st.session_state.stage == 'chat':
 
         # 显示当前实际使用的模型
         st.caption(f"当前模型: {current_model_label}")
-        
+
         with open(downloaded_pdf_path, "rb") as pdf_file:
             st.download_button(
                 label="📥 下载当前论文PDF",
