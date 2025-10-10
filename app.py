@@ -134,7 +134,12 @@ def get_retriever_and_metadata(_paper_id):
     search = arxiv.Search(id_list=[_paper_id])
     paper = next(client.results(search))
 
-    pdf_filename = f"{paper.entry_id.split('/')[-1]}.pdf"
+    # 使用健壮的方式获取 arXiv 短ID，兼容旧式ID（如 "cs/0506025"）与新式ID
+    try:
+        short_id = paper.get_short_id()  # type: ignore[attr-defined]
+    except Exception:
+        short_id = paper.entry_id.split('abs/')[-1]
+    pdf_filename = f"{short_id}.pdf"
     local_pdf_path = os.path.join(PDF_SAVE_PATH, pdf_filename)
 
     # 如果本地不存在PDF，则下载
@@ -171,6 +176,11 @@ if 'memory' not in st.session_state:
 
 # --- 选择论文的回调，避免循环变量绑定问题，确保点击哪一项就进入哪一项 ---
 def _on_select_paper(paper_id: str) -> None:
+    # 选择新论文时清理缓存，避免因缓存键异常导致始终展示同一篇论文
+    try:
+        get_retriever_and_metadata.clear()
+    except Exception:
+        pass
     st.session_state.selected_paper_id = paper_id
     st.session_state.stage = 'chat'
     st.session_state.messages = []
@@ -203,7 +213,11 @@ elif st.session_state.stage == 'select':
     if 'search_results' in st.session_state and st.session_state.search_results:
         # 使用可预测的 key 与 on_click 回调，避免 for 循环闭包导致始终取第一项
         for idx, paper in enumerate(st.session_state.search_results):
-            paper_id = paper.entry_id.split('/')[-1]
+            # 兼容旧式与新式 arXiv ID，避免因丢失分类前缀导致始终打开同一篇论文
+            try:
+                paper_id = paper.get_short_id()  # type: ignore[attr-defined]
+            except Exception:
+                paper_id = paper.entry_id.split('abs/')[-1]
             st.subheader(paper.title)
             st.write(f"**作者**: {', '.join(author.name for author in paper.authors)}")
             st.write(f"**摘要**: {paper.summary[:300]}...")
